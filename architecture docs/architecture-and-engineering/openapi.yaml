@@ -1,0 +1,2024 @@
+openapi: 3.0.3
+
+info:
+  title: PharmaDesk API
+  version: 1.0.0
+  description: |
+    REST API for the PharmaDesk pharmacy management platform.
+
+    ## Authentication
+    All endpoints (except `/actuator/health`) require a valid Okta-issued JWT Bearer token.
+    Tokens are obtained directly from Okta via Authorization Code + PKCE flow on the web/mobile clients.
+    The API is a pure OAuth2 Resource Server — it validates tokens but never issues them.
+
+    ## Roles
+    | Okta Group | Role | Access |
+    |---|---|---|
+    | `pharmadesk-admins` | `ROLE_ADMIN` | Full system access |
+    | `pharmadesk-pharmacists` | `ROLE_PHARMACIST` | Prescriptions, inventory, billing, alerts |
+    | `pharmadesk-patients` | `ROLE_PATIENT` | Own prescriptions, refills, billing |
+
+    Role hierarchy: `ROLE_ADMIN` ⊃ `ROLE_PHARMACIST` ⊃ `ROLE_PATIENT`
+
+    ## Conventions
+    - Base path: `/api/v1`
+    - All bodies: `application/json`
+    - Field naming: `camelCase`
+    - Dates: ISO 8601 (`2026-06-06T10:00:00Z`)
+    - UUIDs for all resource identifiers
+
+  contact:
+    name: PharmaDesk Engineering
+  license:
+    name: Private
+
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local development
+  - url: https://api-stg.pharmadesk.internal/api/v1
+    description: Staging
+  - url: https://api.pharmadesk.internal/api/v1
+    description: Production
+
+tags:
+  - name: Auth
+    description: Token revocation (all other auth flows handled by Okta directly)
+  - name: Users
+    description: Own profile management
+  - name: Patients
+    description: Patient profile management (Pharmacist and Admin only)
+  - name: Prescriptions
+    description: Prescription lifecycle — create, verify, dispense, reject, cancel, refill
+  - name: Drugs
+    description: Drug catalog and stock batch management
+  - name: Billing
+    description: Invoice generation and payment recording
+  - name: Notifications
+    description: In-app notification centre and user preferences
+  - name: Analytics
+    description: Dashboard metrics and report exports (Pharmacist and Admin only)
+
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+security:
+  - oktaJwt: []
+
+components:
+  securitySchemes:
+    oktaJwt:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "Okta-issued JWT access token. Pass as `Authorization: Bearer <token>`."
+
+  # -------------------------------------------------------------------------
+  # Shared parameters
+  # -------------------------------------------------------------------------
+  parameters:
+    PageParam:
+      name: page
+      in: query
+      description: 1-based page number
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+
+    PageSizeParam:
+      name: pageSize
+      in: query
+      description: Items per page (max 100)
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+    SortParam:
+      name: sort
+      in: query
+      description: "Sort field and direction, e.g. `createdAt:desc`"
+      schema:
+        type: string
+
+  # -------------------------------------------------------------------------
+  # Reusable schemas
+  # -------------------------------------------------------------------------
+  schemas:
+
+    # -- Envelopes -----------------------------------------------------------
+
+    PaginationMeta:
+      type: object
+      required: [page, pageSize, total]
+      properties:
+        page:
+          type: integer
+          example: 1
+        pageSize:
+          type: integer
+          example: 20
+        total:
+          type: integer
+          example: 150
+
+    ErrorResponse:
+      type: object
+      required: [statusCode, error, message]
+      properties:
+        statusCode:
+          type: integer
+          example: 400
+        error:
+          type: string
+          example: Bad Request
+        message:
+          type: string
+          example: dosage must not be empty
+        fieldErrors:
+          type: array
+          description: Present on 400 validation errors only
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+                example: dosage
+              message:
+                type: string
+                example: must not be empty
+
+    # -- Primitives ----------------------------------------------------------
+
+    UUID:
+      type: string
+      format: uuid
+      example: 3fa85f64-5717-4562-b3fc-2c963f66afa6
+
+    ISODateTime:
+      type: string
+      format: date-time
+      example: "2026-06-06T10:00:00Z"
+
+    ISODate:
+      type: string
+      format: date
+      example: "2026-06-06"
+
+    # -- Enums ---------------------------------------------------------------
+
+    PrescriptionStatus:
+      type: string
+      enum: [PENDING, VERIFIED, DISPENSED, REJECTED, CANCELLED]
+      description: |
+        - `PENDING` — created, awaiting pharmacist verification
+        - `VERIFIED` — approved, ready for dispensing
+        - `DISPENSED` — medication handed to patient
+        - `REJECTED` — pharmacist rejected with reason
+        - `CANCELLED` — cancelled by pharmacist or admin before dispensing
+
+    InvoiceStatus:
+      type: string
+      enum: [PENDING, PARTIAL, PAID]
+
+    PaymentMethod:
+      type: string
+      enum: [CASH, CARD, BANK_TRANSFER, INSURANCE]
+
+    NotificationType:
+      type: string
+      enum: [PICKUP_READY, REFILL_REMINDER, LOW_STOCK, EXPIRY_WARNING, SYSTEM]
+
+    NotificationChannel:
+      type: string
+      enum: [IN_APP, EMAIL, PUSH]
+
+    DrugCategory:
+      type: string
+      enum: [ANTIBIOTIC, ANALGESIC, ANTIHYPERTENSIVE, ANTIDIABETIC, ANTIHISTAMINE, VITAMIN, OTHER]
+
+    DosageForm:
+      type: string
+      enum: [TABLET, CAPSULE, LIQUID, INJECTION, TOPICAL, INHALER, DROPS]
+
+    PurchaseOrderStatus:
+      type: string
+      enum: [DRAFT, SUBMITTED, RECEIVED, CANCELLED]
+
+    ReportFormat:
+      type: string
+      enum: [CSV, PDF]
+
+    TimePeriod:
+      type: string
+      enum: [WEEKLY, MONTHLY, YEARLY]
+
+    # -- User ----------------------------------------------------------------
+
+    UserProfile:
+      type: object
+      required: [id, email, fullName, role, createdAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        email:
+          type: string
+          format: email
+          example: jane.doe@pharmadesk.com
+        fullName:
+          type: string
+          example: Jane Doe
+        role:
+          type: string
+          enum: [PATIENT, PHARMACIST, ADMIN]
+        phoneNumber:
+          type: string
+          example: "+61412345678"
+        createdAt:
+          $ref: '#/components/schemas/ISODateTime'
+        updatedAt:
+          $ref: '#/components/schemas/ISODateTime'
+
+    UpdateProfileRequest:
+      type: object
+      properties:
+        fullName:
+          type: string
+          minLength: 2
+          maxLength: 100
+        phoneNumber:
+          type: string
+
+    # -- Patient -------------------------------------------------------------
+
+    Patient:
+      type: object
+      required: [id, userId, dateOfBirth, createdAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        userId:
+          $ref: '#/components/schemas/UUID'
+        fullName:
+          type: string
+          example: John Smith
+        email:
+          type: string
+          format: email
+        dateOfBirth:
+          $ref: '#/components/schemas/ISODate'
+        address:
+          type: string
+          example: 42 Pharmacy Lane, Melbourne VIC 3000
+        allergies:
+          type: array
+          items:
+            type: string
+          example: [penicillin, sulfa]
+        notes:
+          type: string
+          description: Internal pharmacist notes about the patient
+        createdAt:
+          $ref: '#/components/schemas/ISODateTime'
+        updatedAt:
+          $ref: '#/components/schemas/ISODateTime'
+
+    PatientSummary:
+      type: object
+      description: Compact patient representation used in list views
+      required: [id, fullName, dateOfBirth]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        fullName:
+          type: string
+        dateOfBirth:
+          $ref: '#/components/schemas/ISODate'
+        email:
+          type: string
+          format: email
+
+    UpdatePatientRequest:
+      type: object
+      properties:
+        address:
+          type: string
+        allergies:
+          type: array
+          items:
+            type: string
+        notes:
+          type: string
+
+    PatientListResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/PatientSummary'
+        meta:
+          $ref: '#/components/schemas/PaginationMeta'
+
+    # -- Drug ----------------------------------------------------------------
+
+    Drug:
+      type: object
+      required: [id, name, category, dosageForm, unitPrice, active]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        name:
+          type: string
+          example: Amoxicillin 500mg
+        genericName:
+          type: string
+          example: Amoxicillin
+        category:
+          $ref: '#/components/schemas/DrugCategory'
+        dosageForm:
+          $ref: '#/components/schemas/DosageForm'
+        unitPrice:
+          type: number
+          format: decimal
+          example: 12.50
+        lowStockThreshold:
+          type: integer
+          description: Units below which a low-stock alert is triggered
+          example: 50
+        active:
+          type: boolean
+          default: true
+        createdAt:
+          $ref: '#/components/schemas/ISODateTime'
+        updatedAt:
+          $ref: '#/components/schemas/ISODateTime'
+
+    DrugSummary:
+      type: object
+      required: [id, name, category, dosageForm, unitPrice]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        name:
+          type: string
+        category:
+          $ref: '#/components/schemas/DrugCategory'
+        dosageForm:
+          $ref: '#/components/schemas/DosageForm'
+        unitPrice:
+          type: number
+          format: decimal
+        totalStock:
+          type: integer
+          description: Sum of all non-expired batch quantities
+        active:
+          type: boolean
+
+    CreateDrugRequest:
+      type: object
+      required: [name, category, dosageForm, unitPrice]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 200
+        genericName:
+          type: string
+        category:
+          $ref: '#/components/schemas/DrugCategory'
+        dosageForm:
+          $ref: '#/components/schemas/DosageForm'
+        unitPrice:
+          type: number
+          format: decimal
+          minimum: 0
+        lowStockThreshold:
+          type: integer
+          minimum: 0
+          default: 0
+
+    UpdateDrugRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        genericName:
+          type: string
+        unitPrice:
+          type: number
+          format: decimal
+          minimum: 0
+        lowStockThreshold:
+          type: integer
+          minimum: 0
+        active:
+          type: boolean
+
+    DrugListResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/DrugSummary'
+        meta:
+          $ref: '#/components/schemas/PaginationMeta'
+
+    # -- Stock Batch ---------------------------------------------------------
+
+    DrugStockBatch:
+      type: object
+      required: [id, drugId, quantity, expiryDate, receivedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        drugId:
+          $ref: '#/components/schemas/UUID'
+        quantity:
+          type: integer
+          minimum: 0
+        batchNumber:
+          type: string
+          example: BN-2026-0412
+        expiryDate:
+          $ref: '#/components/schemas/ISODate'
+        receivedAt:
+          $ref: '#/components/schemas/ISODateTime'
+        supplierId:
+          $ref: '#/components/schemas/UUID'
+
+    AddStockBatchRequest:
+      type: object
+      required: [quantity, expiryDate]
+      properties:
+        quantity:
+          type: integer
+          minimum: 1
+        batchNumber:
+          type: string
+        expiryDate:
+          $ref: '#/components/schemas/ISODate'
+        supplierId:
+          $ref: '#/components/schemas/UUID'
+
+    AdjustStockRequest:
+      type: object
+      required: [quantityDelta, reason]
+      properties:
+        quantityDelta:
+          type: integer
+          description: Positive to add, negative to remove
+          example: -10
+        reason:
+          type: string
+          example: Manual correction after stock count
+
+    StockListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/DrugStockBatch'
+
+    # -- Prescription --------------------------------------------------------
+
+    Prescription:
+      type: object
+      required: [id, patientId, pharmacistId, drugId, dosage, quantity, status, createdAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        patientId:
+          $ref: '#/components/schemas/UUID'
+        pharmacistId:
+          $ref: '#/components/schemas/UUID'
+        drugId:
+          $ref: '#/components/schemas/UUID'
+        drugName:
+          type: string
+          description: Denormalised drug name for display
+          example: Amoxicillin 500mg
+        dosage:
+          type: string
+          example: "500mg twice daily for 7 days"
+        quantity:
+          type: integer
+          minimum: 1
+          example: 14
+        instructions:
+          type: string
+          example: Take with food
+        status:
+          $ref: '#/components/schemas/PrescriptionStatus'
+        rejectionReason:
+          type: string
+          description: Present when status is REJECTED
+        estimatedEndDate:
+          $ref: '#/components/schemas/ISODate'
+          description: Calculated supply end date used for refill reminders
+        dispensedAt:
+          $ref: '#/components/schemas/ISODateTime'
+        createdAt:
+          $ref: '#/components/schemas/ISODateTime'
+        updatedAt:
+          $ref: '#/components/schemas/ISODateTime'
+
+    PrescriptionSummary:
+      type: object
+      required: [id, patientId, drugName, status, createdAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        patientId:
+          $ref: '#/components/schemas/UUID'
+        patientName:
+          type: string
+        drugName:
+          type: string
+        dosage:
+          type: string
+        status:
+          $ref: '#/components/schemas/PrescriptionStatus'
+        createdAt:
+          $ref: '#/components/schemas/ISODateTime'
+
+    CreatePrescriptionRequest:
+      type: object
+      required: [patientId, drugId, dosage, quantity]
+      properties:
+        patientId:
+          $ref: '#/components/schemas/UUID'
+        drugId:
+          $ref: '#/components/schemas/UUID'
+        dosage:
+          type: string
+          minLength: 1
+          maxLength: 500
+          example: "500mg twice daily for 7 days"
+        quantity:
+          type: integer
+          minimum: 1
+        instructions:
+          type: string
+          maxLength: 1000
+
+    UpdatePrescriptionRequest:
+      type: object
+      description: Used by pharmacist/admin to verify, dispense, reject, or modify a prescription
+      properties:
+        status:
+          $ref: '#/components/schemas/PrescriptionStatus'
+        rejectionReason:
+          type: string
+          description: Required when status is REJECTED
+        dosage:
+          type: string
+          description: Modifiable while status is PENDING
+        quantity:
+          type: integer
+          minimum: 1
+          description: Modifiable while status is PENDING
+        instructions:
+          type: string
+
+    PrescriptionListResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/PrescriptionSummary'
+        meta:
+          $ref: '#/components/schemas/PaginationMeta'
+
+    RefillRequest:
+      type: object
+      properties:
+        notes:
+          type: string
+          description: Optional patient note to the pharmacist
+          maxLength: 500
+
+    AuditLogEntry:
+      type: object
+      required: [id, prescriptionId, action, performedBy, performedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        prescriptionId:
+          $ref: '#/components/schemas/UUID'
+        action:
+          type: string
+          enum: [CREATED, VERIFIED, DISPENSED, REJECTED, CANCELLED, MODIFIED, REFILL_REQUESTED]
+        performedBy:
+          $ref: '#/components/schemas/UUID'
+        performedByName:
+          type: string
+        performedAt:
+          $ref: '#/components/schemas/ISODateTime'
+        changes:
+          type: object
+          description: Key-value diff of changed fields
+          additionalProperties:
+            type: object
+            properties:
+              from:
+                type: string
+              to:
+                type: string
+
+    AuditLogResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditLogEntry'
+
+    # -- Invoice -------------------------------------------------------------
+
+    Invoice:
+      type: object
+      required: [id, prescriptionId, patientId, subtotal, total, status, issuedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        prescriptionId:
+          $ref: '#/components/schemas/UUID'
+        patientId:
+          $ref: '#/components/schemas/UUID'
+        patientName:
+          type: string
+        drugName:
+          type: string
+        quantity:
+          type: integer
+        unitPrice:
+          type: number
+          format: decimal
+        subtotal:
+          type: number
+          format: decimal
+        discountAmount:
+          type: number
+          format: decimal
+          default: 0
+        total:
+          type: number
+          format: decimal
+        status:
+          $ref: '#/components/schemas/InvoiceStatus'
+        amountPaid:
+          type: number
+          format: decimal
+        amountOutstanding:
+          type: number
+          format: decimal
+        issuedAt:
+          $ref: '#/components/schemas/ISODateTime'
+        payments:
+          type: array
+          items:
+            $ref: '#/components/schemas/Payment'
+
+    InvoiceSummary:
+      type: object
+      required: [id, patientName, drugName, total, status, issuedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        patientName:
+          type: string
+        drugName:
+          type: string
+        total:
+          type: number
+          format: decimal
+        amountOutstanding:
+          type: number
+          format: decimal
+        status:
+          $ref: '#/components/schemas/InvoiceStatus'
+        issuedAt:
+          $ref: '#/components/schemas/ISODateTime'
+
+    InvoiceListResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/InvoiceSummary'
+        meta:
+          $ref: '#/components/schemas/PaginationMeta'
+
+    Payment:
+      type: object
+      required: [id, invoiceId, amount, method, recordedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        invoiceId:
+          $ref: '#/components/schemas/UUID'
+        amount:
+          type: number
+          format: decimal
+          minimum: 0.01
+        method:
+          $ref: '#/components/schemas/PaymentMethod'
+        reference:
+          type: string
+          description: Card last 4 digits, bank transfer reference, etc.
+        recordedAt:
+          $ref: '#/components/schemas/ISODateTime'
+        recordedBy:
+          $ref: '#/components/schemas/UUID'
+
+    RecordPaymentRequest:
+      type: object
+      required: [amount, method]
+      properties:
+        amount:
+          type: number
+          format: decimal
+          minimum: 0.01
+          example: 25.00
+        method:
+          $ref: '#/components/schemas/PaymentMethod'
+        reference:
+          type: string
+
+    # -- Notification --------------------------------------------------------
+
+    Notification:
+      type: object
+      required: [id, type, title, body, read, createdAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        type:
+          $ref: '#/components/schemas/NotificationType'
+        title:
+          type: string
+          example: Prescription Ready for Pickup
+        body:
+          type: string
+          example: Your prescription for Amoxicillin 500mg is ready for collection.
+        read:
+          type: boolean
+        relatedEntityId:
+          $ref: '#/components/schemas/UUID'
+          description: ID of the prescription, invoice, or drug this notification relates to
+        createdAt:
+          $ref: '#/components/schemas/ISODateTime'
+
+    NotificationListResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Notification'
+        meta:
+          $ref: '#/components/schemas/PaginationMeta'
+
+    NotificationPreferences:
+      type: object
+      properties:
+        pickupReady:
+          type: array
+          items:
+            $ref: '#/components/schemas/NotificationChannel'
+          example: [IN_APP, EMAIL, PUSH]
+        refillReminder:
+          type: array
+          items:
+            $ref: '#/components/schemas/NotificationChannel'
+          example: [IN_APP, PUSH]
+        systemAlerts:
+          type: array
+          items:
+            $ref: '#/components/schemas/NotificationChannel'
+          example: [IN_APP]
+
+    # -- Analytics -----------------------------------------------------------
+
+    TopDrugEntry:
+      type: object
+      properties:
+        drugId:
+          $ref: '#/components/schemas/UUID'
+        drugName:
+          type: string
+        dispensedCount:
+          type: integer
+        totalRevenue:
+          type: number
+          format: decimal
+
+    TopDrugsResponse:
+      type: object
+      required: [period, data]
+      properties:
+        period:
+          $ref: '#/components/schemas/TimePeriod'
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/TopDrugEntry'
+
+    RevenueSummaryEntry:
+      type: object
+      properties:
+        month:
+          type: string
+          example: "2026-05"
+        invoiced:
+          type: number
+          format: decimal
+        collected:
+          type: number
+          format: decimal
+        outstanding:
+          type: number
+          format: decimal
+
+    RevenueSummaryResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/RevenueSummaryEntry'
+
+    LowStockEntry:
+      type: object
+      properties:
+        drugId:
+          $ref: '#/components/schemas/UUID'
+        drugName:
+          type: string
+        currentStock:
+          type: integer
+        threshold:
+          type: integer
+
+    LowStockResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/LowStockEntry'
+
+    PrescriptionVolumeEntry:
+      type: object
+      properties:
+        date:
+          type: string
+          description: Date bucket (day / week / month depending on period)
+          example: "2026-05-01"
+        count:
+          type: integer
+
+    PrescriptionVolumeResponse:
+      type: object
+      required: [period, data]
+      properties:
+        period:
+          $ref: '#/components/schemas/TimePeriod'
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/PrescriptionVolumeEntry'
+
+  # -------------------------------------------------------------------------
+  # Reusable responses
+  # -------------------------------------------------------------------------
+  responses:
+    Unauthorized:
+      description: Missing or invalid Bearer token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            statusCode: 401
+            error: Unauthorized
+            message: Bearer token is missing or expired
+
+    Forbidden:
+      description: Authenticated but insufficient role
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            statusCode: 403
+            error: Forbidden
+            message: Access denied — insufficient role
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            statusCode: 404
+            error: Not Found
+            message: Prescription not found
+
+    Conflict:
+      description: Business rule conflict (e.g. duplicate prescription)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            statusCode: 409
+            error: Conflict
+            message: An active prescription for this drug already exists for this patient
+
+    UnprocessableEntity:
+      description: Invalid state transition or business logic violation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            statusCode: 422
+            error: Unprocessable Entity
+            message: Cannot dispense a prescription in PENDING status
+
+    ValidationError:
+      description: Request body failed validation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            statusCode: 400
+            error: Bad Request
+            message: Validation failed
+            fieldErrors:
+              - field: dosage
+                message: must not be empty
+              - field: quantity
+                message: must be greater than 0
+
+# =============================================================================
+# Paths
+# =============================================================================
+paths:
+
+  # ---------------------------------------------------------------------------
+  # Auth
+  # ---------------------------------------------------------------------------
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke current session token
+      description: |
+        Revokes the access token at Okta's revocation endpoint and clears any
+        server-side session context. Clients should discard all locally stored
+        tokens after calling this endpoint.
+      operationId: logout
+      responses:
+        '204':
+          description: Token revoked successfully
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ---------------------------------------------------------------------------
+  # Users
+  # ---------------------------------------------------------------------------
+
+  /users/me:
+    get:
+      tags: [Users]
+      summary: Get own profile
+      operationId: getMyProfile
+      responses:
+        '200':
+          description: Current user's profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    patch:
+      tags: [Users]
+      summary: Update own profile
+      description: Updates mutable fields on the caller's own profile (display name, phone).
+      operationId: updateMyProfile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProfileRequest'
+      responses:
+        '200':
+          description: Updated profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ---------------------------------------------------------------------------
+  # Patients
+  # ---------------------------------------------------------------------------
+
+  /patients:
+    get:
+      tags: [Patients]
+      summary: List patients
+      description: Returns a paginated list of patient profiles. Restricted to Pharmacist and Admin.
+      operationId: listPatients
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - name: search
+          in: query
+          description: Free-text search on patient name or email
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Paginated patient list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PatientListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /patients/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/UUID'
+
+    get:
+      tags: [Patients]
+      summary: Get patient detail
+      operationId: getPatient
+      responses:
+        '200':
+          description: Full patient profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Patient'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [Patients]
+      summary: Update patient profile
+      description: Updates pharmacy-managed fields (allergies, address, notes). Pharmacist and Admin only.
+      operationId: updatePatient
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePatientRequest'
+      responses:
+        '200':
+          description: Updated patient profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Patient'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ---------------------------------------------------------------------------
+  # Prescriptions
+  # ---------------------------------------------------------------------------
+
+  /prescriptions:
+    get:
+      tags: [Prescriptions]
+      summary: List all prescriptions
+      description: Paginated, filterable list of prescriptions. Pharmacist and Admin only.
+      operationId: listPrescriptions
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - $ref: '#/components/parameters/SortParam'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/PrescriptionStatus'
+        - name: patientId
+          in: query
+          schema:
+            $ref: '#/components/schemas/UUID'
+        - name: drugId
+          in: query
+          schema:
+            $ref: '#/components/schemas/UUID'
+        - name: dateFrom
+          in: query
+          schema:
+            $ref: '#/components/schemas/ISODate'
+        - name: dateTo
+          in: query
+          schema:
+            $ref: '#/components/schemas/ISODate'
+      responses:
+        '200':
+          description: Paginated prescription list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrescriptionListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    post:
+      tags: [Prescriptions]
+      summary: Create prescription
+      description: |
+        Creates a new prescription in `PENDING` status. Pharmacist only.
+
+        Business rules enforced:
+        - Drug must be active and have sufficient stock
+        - Patient must not have an active prescription for the same drug (duplicate check)
+        - Conflict check flags concurrent prescriptions for drugs with known interactions
+      operationId: createPrescription
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePrescriptionRequest'
+      responses:
+        '201':
+          description: Prescription created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Prescription'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /prescriptions/my:
+    get:
+      tags: [Prescriptions]
+      summary: List own prescriptions
+      description: Returns the authenticated patient's own prescriptions. Patient only.
+      operationId: listMyPrescriptions
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/PrescriptionStatus'
+        - name: dateFrom
+          in: query
+          schema:
+            $ref: '#/components/schemas/ISODate'
+        - name: dateTo
+          in: query
+          schema:
+            $ref: '#/components/schemas/ISODate'
+      responses:
+        '200':
+          description: Paginated list of own prescriptions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrescriptionListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /prescriptions/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/UUID'
+
+    get:
+      tags: [Prescriptions]
+      summary: Get prescription detail
+      description: All authenticated roles. Patients may only access their own prescriptions (enforced server-side).
+      operationId: getPrescription
+      responses:
+        '200':
+          description: Prescription detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Prescription'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [Prescriptions]
+      summary: Update prescription
+      description: |
+        Updates status or content of a prescription. Pharmacist and Admin only.
+
+        Valid status transitions:
+        - `PENDING` → `VERIFIED`
+        - `PENDING` → `REJECTED` (requires `rejectionReason`)
+        - `VERIFIED` → `DISPENSED` (decrements stock, generates invoice)
+        - `PENDING` | `VERIFIED` → `CANCELLED`
+        - Content fields (`dosage`, `quantity`, `instructions`) are only modifiable in `PENDING` status
+      operationId: updatePrescription
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePrescriptionRequest'
+      responses:
+        '200':
+          description: Updated prescription
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Prescription'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+    delete:
+      tags: [Prescriptions]
+      summary: Cancel prescription
+      description: |
+        Cancels the prescription (sets status to `CANCELLED`). Pharmacist and Admin only.
+        Only valid for prescriptions in `PENDING` or `VERIFIED` status.
+      operationId: cancelPrescription
+      responses:
+        '204':
+          description: Prescription cancelled
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /prescriptions/{id}/audit:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/UUID'
+
+    get:
+      tags: [Prescriptions]
+      summary: Get prescription audit trail
+      description: Returns the full immutable audit log for a prescription. Pharmacist and Admin only.
+      operationId: getPrescriptionAuditTrail
+      responses:
+        '200':
+          description: Audit log entries ordered by time ascending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditLogResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /prescriptions/{id}/refill:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/UUID'
+
+    post:
+      tags: [Prescriptions]
+      summary: Request prescription refill
+      description: |
+        Submits a refill request for a dispensed prescription. Patient only.
+        Creates a new prescription in `PENDING` status linked to the original.
+        Only valid when the original prescription is in `DISPENSED` status.
+      operationId: requestRefill
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefillRequest'
+      responses:
+        '201':
+          description: New prescription created for the refill
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Prescription'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  # ---------------------------------------------------------------------------
+  # Drugs & Inventory
+  # ---------------------------------------------------------------------------
+
+  /drugs:
+    get:
+      tags: [Drugs]
+      summary: List drugs
+      description: Paginated, searchable drug catalog. All authenticated roles.
+      operationId: listDrugs
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - name: search
+          in: query
+          description: Search by drug name or generic name
+          schema:
+            type: string
+        - name: category
+          in: query
+          schema:
+            $ref: '#/components/schemas/DrugCategory'
+        - name: active
+          in: query
+          schema:
+            type: boolean
+            default: true
+      responses:
+        '200':
+          description: Paginated drug list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DrugListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Drugs]
+      summary: Add drug to catalog
+      description: Creates a new drug. Pharmacist and Admin only.
+      operationId: createDrug
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDrugRequest'
+      responses:
+        '201':
+          description: Drug created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Drug'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: A drug with the same name already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /drugs/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/UUID'
+
+    patch:
+      tags: [Drugs]
+      summary: Update drug
+      description: Updates drug catalog fields. Pharmacist and Admin only.
+      operationId: updateDrug
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDrugRequest'
+      responses:
+        '200':
+          description: Updated drug
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Drug'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /drugs/{id}/stock:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/UUID'
+
+    get:
+      tags: [Drugs]
+      summary: Get stock batches for a drug
+      description: Returns all stock batches ordered by expiry date ascending (FEFO order). Pharmacist and Admin only.
+      operationId: getDrugStock
+      responses:
+        '200':
+          description: Stock batches
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    post:
+      tags: [Drugs]
+      summary: Add stock batch
+      description: Records a new stock batch received from a supplier. Pharmacist and Admin only.
+      operationId: addStockBatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddStockBatchRequest'
+      responses:
+        '201':
+          description: Stock batch created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DrugStockBatch'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /drugs/{id}/stock/{batchId}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/UUID'
+      - name: batchId
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/UUID'
+
+    patch:
+      tags: [Drugs]
+      summary: Adjust stock batch quantity
+      description: Manual stock adjustment (e.g. stock count correction, damage). Pharmacist and Admin only.
+      operationId: adjustStock
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdjustStockRequest'
+      responses:
+        '200':
+          description: Updated batch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DrugStockBatch'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: Adjustment would result in negative stock
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # ---------------------------------------------------------------------------
+  # Billing
+  # ---------------------------------------------------------------------------
+
+  /invoices:
+    get:
+      tags: [Billing]
+      summary: List invoices
+      description: Paginated, filterable invoice list. Pharmacist and Admin only.
+      operationId: listInvoices
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - $ref: '#/components/parameters/SortParam'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/InvoiceStatus'
+        - name: patientId
+          in: query
+          schema:
+            $ref: '#/components/schemas/UUID'
+        - name: dateFrom
+          in: query
+          schema:
+            $ref: '#/components/schemas/ISODate'
+        - name: dateTo
+          in: query
+          schema:
+            $ref: '#/components/schemas/ISODate'
+      responses:
+        '200':
+          description: Paginated invoice list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /invoices/my:
+    get:
+      tags: [Billing]
+      summary: List own invoices
+      description: Returns the authenticated patient's own billing history. Patient only.
+      operationId: listMyInvoices
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/InvoiceStatus'
+      responses:
+        '200':
+          description: Paginated invoice list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /invoices/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/UUID'
+
+    get:
+      tags: [Billing]
+      summary: Get invoice detail
+      description: All authenticated roles. Patients may only access their own invoices.
+      operationId: getInvoice
+      responses:
+        '200':
+          description: Full invoice with payment history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invoice'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /invoices/{id}/payments:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/UUID'
+
+    post:
+      tags: [Billing]
+      summary: Record payment against invoice
+      description: |
+        Records a payment. Supports partial payments — multiple calls are valid
+        until the invoice is fully paid. Pharmacist and Admin only.
+
+        Business rules:
+        - Payment amount must be ≤ outstanding amount
+        - Invoice status is automatically updated to `PARTIAL` or `PAID`
+      operationId: recordPayment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordPaymentRequest'
+      responses:
+        '201':
+          description: Payment recorded; returns updated invoice
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invoice'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: Payment exceeds outstanding amount or invoice already fully paid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /invoices/{id}/pdf:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/UUID'
+
+    get:
+      tags: [Billing]
+      summary: Download invoice PDF
+      description: Generates and streams a PDF of the invoice. All authenticated roles; patients limited to own invoices.
+      operationId: downloadInvoicePdf
+      responses:
+        '200':
+          description: PDF binary stream
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ---------------------------------------------------------------------------
+  # Notifications
+  # ---------------------------------------------------------------------------
+
+  /notifications:
+    get:
+      tags: [Notifications]
+      summary: List own notifications
+      description: Returns the authenticated user's notification feed, newest first. All roles.
+      operationId: listNotifications
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - name: unreadOnly
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Paginated notification list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /notifications/{id}/read:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/UUID'
+
+    patch:
+      tags: [Notifications]
+      summary: Mark notification as read
+      operationId: markNotificationRead
+      responses:
+        '204':
+          description: Marked as read
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /notifications/read-all:
+    post:
+      tags: [Notifications]
+      summary: Mark all notifications as read
+      operationId: markAllNotificationsRead
+      responses:
+        '204':
+          description: All notifications marked as read
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /notifications/preferences:
+    get:
+      tags: [Notifications]
+      summary: Get notification preferences
+      operationId: getNotificationPreferences
+      responses:
+        '200':
+          description: Current notification preferences
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationPreferences'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    patch:
+      tags: [Notifications]
+      summary: Update notification preferences
+      operationId: updateNotificationPreferences
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationPreferences'
+      responses:
+        '200':
+          description: Updated preferences
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationPreferences'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ---------------------------------------------------------------------------
+  # Analytics
+  # ---------------------------------------------------------------------------
+
+  /analytics/top-drugs:
+    get:
+      tags: [Analytics]
+      summary: Most dispensed drugs
+      description: Returns the top dispensed drugs ranked by dispense count for the given period. Pharmacist and Admin only.
+      operationId: getTopDrugs
+      parameters:
+        - name: period
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/TimePeriod'
+        - name: limit
+          in: query
+          description: Number of top drugs to return (default 10, max 50)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 10
+      responses:
+        '200':
+          description: Top dispensed drugs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TopDrugsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /analytics/revenue:
+    get:
+      tags: [Analytics]
+      summary: Monthly revenue summary
+      description: Returns month-by-month revenue breakdown (invoiced, collected, outstanding). Pharmacist and Admin only.
+      operationId: getRevenueSummary
+      parameters:
+        - name: from
+          in: query
+          description: Start month inclusive (YYYY-MM)
+          required: true
+          schema:
+            type: string
+            pattern: '^\d{4}-\d{2}$'
+            example: "2026-01"
+        - name: to
+          in: query
+          description: End month inclusive (YYYY-MM)
+          required: true
+          schema:
+            type: string
+            pattern: '^\d{4}-\d{2}$'
+            example: "2026-06"
+      responses:
+        '200':
+          description: Monthly revenue summary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevenueSummaryResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /analytics/low-stock:
+    get:
+      tags: [Analytics]
+      summary: Drugs below stock threshold
+      description: Returns all drugs where current stock ≤ configured low-stock threshold. Pharmacist and Admin only.
+      operationId: getLowStockDrugs
+      responses:
+        '200':
+          description: Low stock drugs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LowStockResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /analytics/prescription-volume:
+    get:
+      tags: [Analytics]
+      summary: Prescription volume trends
+      description: Returns prescription counts bucketed by the requested period. Pharmacist and Admin only.
+      operationId: getPrescriptionVolume
+      parameters:
+        - name: period
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/TimePeriod'
+        - name: dateFrom
+          in: query
+          schema:
+            $ref: '#/components/schemas/ISODate'
+        - name: dateTo
+          in: query
+          schema:
+            $ref: '#/components/schemas/ISODate'
+      responses:
+        '200':
+          description: Prescription volume trend data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrescriptionVolumeResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /analytics/export:
+    get:
+      tags: [Analytics]
+      summary: Export analytics report
+      description: |
+        Exports a full analytics report as CSV or PDF for the specified period.
+        Admin only. Report generation may take up to 30 seconds for 12 months of data.
+      operationId: exportAnalyticsReport
+      parameters:
+        - name: format
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/ReportFormat'
+        - name: dateFrom
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/ISODate'
+        - name: dateTo
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/ISODate'
+      responses:
+        '200':
+          description: Report file stream
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            text/csv:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          description: Date range exceeds maximum allowed (12 months)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'

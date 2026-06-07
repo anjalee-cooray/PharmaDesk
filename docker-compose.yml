@@ -1,0 +1,202 @@
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# PharmaDesk — Local Development Stack
+#
+# Starts: PostgreSQL, Redis, LocalStack (SQS), mock-oauth2-server,
+#         Core Monolith API, and React web app.
+#
+# Notification and Analytics Lambdas are emulated separately via SAM Local:
+#   cd notification-service && sam local start-lambda --port 3001 --env-vars env.local.json
+#   cd analytics-service   && sam local start-lambda --port 3002 --env-vars env.local.json
+#
+# Usage:
+#   docker compose up --build      # first run (builds images)
+#   docker compose up -d           # background
+#   docker compose down            # stop (preserve volumes)
+#   docker compose down -v         # stop + wipe all data
+# ---------------------------------------------------------------------------
+
+networks:
+  pharmadesk:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  localstack_data:
+
+services:
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: pharmadesk-db
+    restart: unless-stopped
+    networks: [pharmadesk]
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: pharmadesk
+      POSTGRES_USER: pharmadesk
+      POSTGRES_PASSWORD: secret
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/local/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pharmadesk -d pharmadesk"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: pharmadesk-redis
+    restart: unless-stopped
+    networks: [pharmadesk]
+    ports:
+      - "6379:6379"
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── LocalStack (SQS) ───────────────────────────────────────────────────────
+  localstack:
+    image: localstack/localstack:3
+    container_name: pharmadesk-localstack
+    restart: unless-stopped
+    networks: [pharmadesk]
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: sqs
+      DEFAULT_REGION: ap-southeast-1
+      PERSISTENCE: 1
+      DEBUG: 0
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep -q '\"sqs\": \"available\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── SQS Queue Initialiser ──────────────────────────────────────────────────
+  # One-shot container: creates all queues + DLQs then exits.
+  sqs-init:
+    image: amazon/aws-cli:latest
+    container_name: pharmadesk-sqs-init
+    networks: [pharmadesk]
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: ap-southeast-1
+    volumes:
+      - ./infra/local/localstack-init.sh:/init.sh:ro
+    entrypoint: ["/bin/sh", "/init.sh"]
+
+  # ── Mock OAuth2 Server (Okta emulation) ───────────────────────────────────
+  mock-oauth2-server:
+    image: ghcr.io/navikt/mock-oauth2-server:2.1.0
+    container_name: pharmadesk-mock-oauth2
+    restart: unless-stopped
+    networks: [pharmadesk]
+    ports:
+      - "8090:8090"
+    environment:
+      SERVER_PORT: 8090
+      JSON_CONFIG_PATH: /config/mock-oauth2-config.json
+    volumes:
+      - ./infra/local/mock-oauth2-config.json:/config/mock-oauth2-config.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8090/pharmadesk/.well-known/openid-configuration"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Core Monolith (Spring Boot) ────────────────────────────────────────────
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+      args:
+        JAVA_VERSION: 21
+    container_name: pharmadesk-api
+    restart: unless-stopped
+    networks: [pharmadesk]
+    ports:
+      - "8080:8080"
+    environment:
+      # Datasource
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/pharmadesk
+      SPRING_DATASOURCE_USERNAME: pharmadesk
+      SPRING_DATASOURCE_PASSWORD: secret
+
+      # Redis
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+
+      # AWS / LocalStack
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: ap-southeast-1
+      AWS_ENDPOINT_OVERRIDE: http://localstack:4566
+
+      # SQS queue URLs
+      PHARMADESK_SQS_EMAIL_QUEUE_URL: http://localstack:4566/000000000000/pharmadesk-email
+      PHARMADESK_SQS_PUSH_QUEUE_URL: http://localstack:4566/000000000000/pharmadesk-push
+      PHARMADESK_SQS_ALERT_QUEUE_URL: http://localstack:4566/000000000000/pharmadesk-alerts
+      PHARMADESK_SQS_DOMAIN_EVENTS_QUEUE_URL: http://localstack:4566/000000000000/pharmadesk-domain-events
+
+      # Okta → mock-oauth2-server
+      SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI: http://mock-oauth2-server:8090/pharmadesk
+
+      # Spring profile + virtual threads
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_THREADS_VIRTUAL_ENABLED: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      sqs-init:
+        condition: service_completed_successfully
+      mock-oauth2-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/actuator/health | grep -q UP"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  # ── React Web App ──────────────────────────────────────────────────────────
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile.dev
+    container_name: pharmadesk-web
+    restart: unless-stopped
+    networks: [pharmadesk]
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8080/api/v1
+      VITE_OKTA_ISSUER: http://localhost:8090/pharmadesk
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - ./web/src:/app/src  # hot-reload

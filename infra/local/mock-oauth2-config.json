@@ -1,0 +1,32 @@
+{
+  "interactiveLogin": true,
+  "httpServer": "NettyWrapper",
+  "tokenCallbacks": [
+    {
+      "issuerId": "pharmadesk",
+      "requestMappings": [
+        {
+          "requestParam": "client_id",
+          "match": "pharmadesk-web-pharmacist",
+          "claims": {
+            "groups": ["pharmadesk-pharmacists"]
+          }
+        },
+        {
+          "requestParam": "client_id",
+          "match": "pharmadesk-web-admin",
+          "claims": {
+            "groups": ["pharmadesk-admins"]
+          }
+        },
+        {
+          "requestParam": "client_id",
+          "match": "pharmadesk-patient",
+          "claims": {
+            "groups": ["pharmadesk-patients"]
+          }
+        }
+      ]
+    }
+  ]
+}

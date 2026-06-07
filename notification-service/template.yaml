@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+# ---------------------------------------------------------------------------
+# PharmaDesk — Notification Service (SAM Template)
+# Three Lambda functions, each triggered by a dedicated SQS queue.
+# Java 21 + SnapStart. Deploy with: sam build && sam deploy --guided
+# ---------------------------------------------------------------------------
+
+Description: PharmaDesk Notification Lambda Functions
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [staging, production]
+    Default: staging
+
+  SendGridSecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing the SendGrid API key
+
+  FcmSecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing the FCM server key
+
+Globals:
+  Function:
+    Runtime: java21
+    SnapStart:
+      ApplyOn: PublishedVersions
+    MemorySize: 512
+    Timeout: 30
+    AutoPublishAlias: live
+    Tags:
+      Project: PharmaDesk
+      Environment: !Ref Environment
+      Service: notification
+
+Resources:
+
+  # ── Email Handler ──────────────────────────────────────────────────────────
+  EmailHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "pharmadesk-email-handler-${Environment}"
+      Handler: com.pharmadesk.notification.EmailHandlerFunction::handleRequest
+      CodeUri: build/libs/notification-service.jar
+      Description: Consumes pharmadesk-email SQS queue and dispatches via SendGrid
+      Environment:
+        Variables:
+          SENDGRID_SECRET_ARN: !Ref SendGridSecretArn
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !Sub "pharmadesk-email-${Environment}"
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref SendGridSecretArn
+      Events:
+        SqsTrigger:
+          Type: SQS
+          Properties:
+            Queue: !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:pharmadesk-email-${Environment}"
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  # ── Push Handler ───────────────────────────────────────────────────────────
+  PushHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "pharmadesk-push-handler-${Environment}"
+      Handler: com.pharmadesk.notification.PushHandlerFunction::handleRequest
+      CodeUri: build/libs/notification-service.jar
+      Description: Consumes pharmadesk-push SQS queue and dispatches via FCM/APNs
+      Environment:
+        Variables:
+          FCM_SECRET_ARN: !Ref FcmSecretArn
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !Sub "pharmadesk-push-${Environment}"
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref FcmSecretArn
+      Events:
+        SqsTrigger:
+          Type: SQS
+          Properties:
+            Queue: !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:pharmadesk-push-${Environment}"
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  # ── Alert Handler ──────────────────────────────────────────────────────────
+  AlertHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "pharmadesk-alert-handler-${Environment}"
+      Handler: com.pharmadesk.notification.AlertHandlerFunction::handleRequest
+      CodeUri: build/libs/notification-service.jar
+      Description: Consumes pharmadesk-alerts SQS queue and routes to email + push
+      Environment:
+        Variables:
+          SENDGRID_SECRET_ARN: !Ref SendGridSecretArn
+          FCM_SECRET_ARN: !Ref FcmSecretArn
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !Sub "pharmadesk-alerts-${Environment}"
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref SendGridSecretArn
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref FcmSecretArn
+      Events:
+        SqsTrigger:
+          Type: SQS
+          Properties:
+            Queue: !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:pharmadesk-alerts-${Environment}"
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+Outputs:
+  EmailHandlerFunctionArn:
+    Value: !GetAtt EmailHandlerFunction.Arn
+  PushHandlerFunctionArn:
+    Value: !GetAtt PushHandlerFunction.Arn
+  AlertHandlerFunctionArn:
+    Value: !GetAtt AlertHandlerFunction.Arn

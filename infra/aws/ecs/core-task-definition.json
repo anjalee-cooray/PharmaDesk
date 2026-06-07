@@ -1,0 +1,80 @@
+{
+  "family": "pharmadesk-core",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::{accountId}:role/pharmadesk-ecs-execution-role",
+  "taskRoleArn": "arn:aws:iam::{accountId}:role/pharmadesk-ecs-task-role",
+  "containerDefinitions": [
+    {
+      "name": "pharmadesk-core",
+      "image": "{accountId}.dkr.ecr.{region}.amazonaws.com/pharmadesk-core:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "SPRING_PROFILES_ACTIVE", "value": "prod" },
+        { "name": "SPRING_THREADS_VIRTUAL_ENABLED", "value": "true" },
+        { "name": "AWS_DEFAULT_REGION", "value": "{region}" }
+      ],
+      "secrets": [
+        {
+          "name": "SPRING_DATASOURCE_URL",
+          "valueFrom": "arn:aws:secretsmanager:{region}:{accountId}:secret:pharmadesk/db-url"
+        },
+        {
+          "name": "SPRING_DATASOURCE_USERNAME",
+          "valueFrom": "arn:aws:secretsmanager:{region}:{accountId}:secret:pharmadesk/db-username"
+        },
+        {
+          "name": "SPRING_DATASOURCE_PASSWORD",
+          "valueFrom": "arn:aws:secretsmanager:{region}:{accountId}:secret:pharmadesk/db-password"
+        },
+        {
+          "name": "SPRING_DATA_REDIS_HOST",
+          "valueFrom": "arn:aws:secretsmanager:{region}:{accountId}:secret:pharmadesk/redis-host"
+        },
+        {
+          "name": "SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI",
+          "valueFrom": "arn:aws:secretsmanager:{region}:{accountId}:secret:pharmadesk/okta-issuer-uri"
+        },
+        {
+          "name": "PHARMADESK_SQS_EMAIL_QUEUE_URL",
+          "valueFrom": "arn:aws:secretsmanager:{region}:{accountId}:secret:pharmadesk/sqs-email-url"
+        },
+        {
+          "name": "PHARMADESK_SQS_PUSH_QUEUE_URL",
+          "valueFrom": "arn:aws:secretsmanager:{region}:{accountId}:secret:pharmadesk/sqs-push-url"
+        },
+        {
+          "name": "PHARMADESK_SQS_ALERT_QUEUE_URL",
+          "valueFrom": "arn:aws:secretsmanager:{region}:{accountId}:secret:pharmadesk/sqs-alerts-url"
+        },
+        {
+          "name": "PHARMADESK_SQS_DOMAIN_EVENTS_QUEUE_URL",
+          "valueFrom": "arn:aws:secretsmanager:{region}:{accountId}:secret:pharmadesk/sqs-domain-events-url"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/pharmadesk-core",
+          "awslogs-region": "{region}",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -sf http://localhost:8080/actuator/health | grep -q UP || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}

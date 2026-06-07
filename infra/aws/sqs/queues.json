@@ -1,0 +1,65 @@
+{
+  "_comment": "SQS queue definitions for PharmaDesk. Deploy via AWS CLI or CloudFormation.",
+  "queues": [
+    {
+      "name": "pharmadesk-email-dlq",
+      "type": "Standard",
+      "messageRetentionSeconds": 1209600
+    },
+    {
+      "name": "pharmadesk-email",
+      "type": "Standard",
+      "visibilityTimeoutSeconds": 30,
+      "messageRetentionSeconds": 345600,
+      "redrivePolicy": {
+        "deadLetterTargetArn": "arn:aws:sqs:{region}:{accountId}:pharmadesk-email-dlq",
+        "maxReceiveCount": 3
+      }
+    },
+    {
+      "name": "pharmadesk-push-dlq",
+      "type": "Standard",
+      "messageRetentionSeconds": 1209600
+    },
+    {
+      "name": "pharmadesk-push",
+      "type": "Standard",
+      "visibilityTimeoutSeconds": 30,
+      "messageRetentionSeconds": 345600,
+      "redrivePolicy": {
+        "deadLetterTargetArn": "arn:aws:sqs:{region}:{accountId}:pharmadesk-push-dlq",
+        "maxReceiveCount": 3
+      }
+    },
+    {
+      "name": "pharmadesk-alerts-dlq",
+      "type": "Standard",
+      "messageRetentionSeconds": 1209600
+    },
+    {
+      "name": "pharmadesk-alerts",
+      "type": "Standard",
+      "visibilityTimeoutSeconds": 30,
+      "messageRetentionSeconds": 345600,
+      "redrivePolicy": {
+        "deadLetterTargetArn": "arn:aws:sqs:{region}:{accountId}:pharmadesk-alerts-dlq",
+        "maxReceiveCount": 3
+      }
+    },
+    {
+      "name": "pharmadesk-domain-events-dlq",
+      "type": "Standard",
+      "messageRetentionSeconds": 1209600
+    },
+    {
+      "name": "pharmadesk-domain-events",
+      "type": "Standard",
+      "visibilityTimeoutSeconds": 60,
+      "messageRetentionSeconds": 345600,
+      "redrivePolicy": {
+        "deadLetterTargetArn": "arn:aws:sqs:{region}:{accountId}:pharmadesk-domain-events-dlq",
+        "maxReceiveCount": 3
+      }
+    }
+  ]
+}

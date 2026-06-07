@@ -1,0 +1,61 @@
+# ---------------------------------------------------------------------------
+# application-local.yml
+# Spring Boot profile for local Docker Compose development.
+# All values come from environment variables injected by docker-compose.yml.
+# This file is never deployed to staging or production.
+# ---------------------------------------------------------------------------
+
+spring:
+  datasource:
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+
+  threads:
+    virtual:
+      enabled: true
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Points to mock-oauth2-server locally.
+          # Overridden in staging/prod via AWS Secrets Manager.
+          issuer-uri: ${SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI}
+
+cloud:
+  aws:
+    region:
+      static: ap-southeast-1
+    credentials:
+      access-key: ${AWS_ACCESS_KEY_ID}
+      secret-key: ${AWS_SECRET_ACCESS_KEY}
+    sqs:
+      endpoint: ${AWS_ENDPOINT_OVERRIDE}
+
+pharmadesk:
+  sqs:
+    email-queue-url: ${PHARMADESK_SQS_EMAIL_QUEUE_URL}
+    push-queue-url: ${PHARMADESK_SQS_PUSH_QUEUE_URL}
+    alert-queue-url: ${PHARMADESK_SQS_ALERT_QUEUE_URL}
+    domain-events-queue-url: ${PHARMADESK_SQS_DOMAIN_EVENTS_QUEUE_URL}
+
+logging:
+  level:
+    com.pharmadesk: DEBUG
+    org.hibernate.SQL: DEBUG
+    org.hibernate.orm.jdbc.bind: TRACE
+    org.springframework.security: DEBUG
